@@ -134,7 +134,7 @@ This filter is part of FFmpeg and is licensed under the LGPL version 2.1 or late
 
 ## Author
 
-Not sure if Copilot invented this or if used to be part of FFmpeg.
+Not sure whether Copilot invented this or it used to be part of FFmpeg.
 FFmpeg developers - Copyright (c) 2025
 
 ## See Also
