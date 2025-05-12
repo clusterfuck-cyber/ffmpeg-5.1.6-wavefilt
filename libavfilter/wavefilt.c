@@ -154,11 +154,8 @@ static av_cold int init(AVFilterContext *ctx)
         NULL
     };
 
-    // Register formats
-    if ((ret = query_formats(ctx)) < 0)
-        return ret;
-    
-    av_log(ctx, AV_LOG_INFO, "WaveFilt: Initialized with 1 input and 1 output\n");
+    av_log(ctx, AV_LOG_DEBUG, "WaveFilt: Input count: %d, Output count: %d\n", 
+           ctx->nb_inputs, ctx->nb_outputs);
 
     if (s->mode == MODE_CUSTOM) {
         if (!s->custom_expr_x || !s->custom_expr_y) {
@@ -174,7 +171,8 @@ static av_cold int init(AVFilterContext *ctx)
         if ((ret = av_expr_parse(&s->custom_y, s->custom_expr_y, var_names, NULL, NULL, NULL, NULL, 0, ctx)) < 0) {
             av_log(ctx, AV_LOG_ERROR, "Error parsing custom_y expression '%s'\n", s->custom_expr_y);
             return ret;
-        }    }
+        }
+    }
     
     s->time = 0;
     s->pts = AV_NOPTS_VALUE;  // Initialize pts with AV_NOPTS_VALUE
@@ -204,7 +202,12 @@ static int query_formats(AVFilterContext *ctx)
         AV_PIX_FMT_GBRAP, AV_PIX_FMT_GBRAP16,
         AV_PIX_FMT_NONE
     };
-    return ff_set_common_formats(ctx, ff_make_format_list(pixel_fmts));
+    
+    AVFilterFormats *formats = ff_make_format_list(pixel_fmts);
+    if (!formats)
+        return AVERROR(ENOMEM);
+    
+    return ff_set_common_formats(ctx, formats);
 }
 
 static int config_props(AVFilterLink *inlink)
@@ -216,6 +219,12 @@ static int config_props(AVFilterLink *inlink)
     
     if (!desc) {
         av_log(ctx, AV_LOG_ERROR, "Invalid input format\n");
+        return AVERROR(EINVAL);
+    }
+    
+    // Verify we have a valid outlink
+    if (!ctx->outputs[0]) {
+        av_log(ctx, AV_LOG_ERROR, "Missing output pad\n");
         return AVERROR(EINVAL);
     }
     
@@ -240,6 +249,9 @@ static int config_props(AVFilterLink *inlink)
     s->var_values[VAR_H]  = inlink->h;
     s->var_values[VAR_CX] = s->center_x * inlink->w;
     s->var_values[VAR_CY] = s->center_y * inlink->h;
+    
+    av_log(ctx, AV_LOG_INFO, "WaveFilt: Configured input size %dx%d format %s\n", 
+           inlink->w, inlink->h, av_get_pix_fmt_name(inlink->format));
     
     return 0;
 }
@@ -290,9 +302,19 @@ static float bicubic_interp(const uint8_t *src, int x, int y, int stride, int ma
 {
     int x0, y0;
     float tx, ty;
-    float pixels[4][4] = {0};  // Initialize all pixels to 0
-    float rows[4] = {0};       // Initialize all rows to 0
+    float pixels[4][4];
+    float rows[4];
     int i, j;
+    int safe_x, safe_y;
+    int64_t offset;
+    
+    /* Initialize arrays */
+    for (i = 0; i < 4; i++) {
+        rows[i] = 0;
+        for (j = 0; j < 4; j++) {
+            pixels[i][j] = 0;
+        }
+    }
     
     if (!src || stride <= 0 || max_x <= 0 || max_y <= 0)
         return 0;
@@ -300,31 +322,34 @@ static float bicubic_interp(const uint8_t *src, int x, int y, int stride, int ma
     x0 = x >> 16;
     y0 = y >> 16;
     
-    // Ensure we have enough data for bicubic (need 2 pixels on each side)
+    /* Ensure we have enough data for bicubic (need 2 pixels on each side) */
     if (x0 < 1 || x0 >= max_x - 2 || y0 < 1 || y0 >= max_y - 2)
-        return bilinear_interp(src, x, y, stride, max_x, max_y); // Fall back to bilinear when too close to edge
+        return bilinear_interp(src, x, y, stride, max_x, max_y); /* Fall back to bilinear when too close to edge */
     
     tx = (x & 0xFFFF) / 65536.0f;
     ty = (y & 0xFFFF) / 65536.0f;
     
-    #define CLIP(x) av_clip((x), 0, max_x)
-    #define CLIPP(x, y) src[av_clip((y), 0, max_y) * stride + av_clip((x), 0, max_x)]
-    
-    // Add stronger bounds check
+    /* Add stronger bounds check */
     if (max_x <= 0 || max_y <= 0 || stride <= 0 || 
         x0 < 0 || x0 >= max_x || y0 < 0 || y0 >= max_y) {
-        return 0; // Additional safety check
+        return 0; /* Additional safety check */
     }
     
-    // Sample 16 pixels
+    /* Sample 16 pixels */
     for (j = -1; j <= 2; j++) {
         for (i = -1; i <= 2; i++) {
-            int safe_x = av_clip(x0 + i, 0, max_x);
-            int safe_y = av_clip(y0 + j, 0, max_y);
-            if (safe_y * stride + safe_x < 0 || safe_y * stride + safe_x >= (max_y + 1) * stride) {
-                pixels[j+1][i+1] = 0; // Out of bounds
+            safe_x = av_clip(x0 + i, 0, max_x);
+            safe_y = av_clip(y0 + j, 0, max_y);
+            
+            /* Calculate offset with overflow protection */
+            offset = (int64_t)safe_y * stride + safe_x;
+            
+            if (safe_y >= 0 && safe_y <= max_y && 
+                safe_x >= 0 && safe_x <= max_x && 
+                offset >= 0 && offset < (int64_t)(max_y + 1) * stride) {
+                pixels[j+1][i+1] = src[offset];
             } else {
-                pixels[j+1][i+1] = src[safe_y * stride + safe_x];
+                pixels[j+1][i+1] = 0; /* Out of bounds */
             }
         }
     }
@@ -348,11 +373,11 @@ static double calculate_x_displacement(WaveFiltContext *s, int x, int y, int pla
     double nx, ny, cx, cy;
     double dx_center, dy_center, distance, decay_factor;
     
-    // Safety check for division by zero
+    /* Safety check for division by zero */
     if (!s || width <= 0 || height <= 0) 
         return 0;
     
-    // Safety check for coordinates
+    /* Safety check for coordinates */
     if (x < 0 || x >= width || y < 0 || y >= height)
         return 0;
     
@@ -361,7 +386,7 @@ static double calculate_x_displacement(WaveFiltContext *s, int x, int y, int pla
     cx = s->var_values[VAR_CX] / width;
     cy = s->var_values[VAR_CY] / height;
     
-    // Calculate distance from center for decay
+    /* Calculate distance from center for decay */
     dx_center = nx - cx;
     dy_center = ny - cy;
     distance = sqrt(dx_center*dx_center + dy_center*dy_center);
@@ -404,11 +429,11 @@ static double calculate_y_displacement(WaveFiltContext *s, int x, int y, int pla
     double nx, ny, cx, cy;
     double dx_center, dy_center, distance, decay_factor;
     
-    // Safety check for division by zero
+    /* Safety check for division by zero */
     if (!s || width <= 0 || height <= 0) 
         return 0;
     
-    // Safety check for coordinates
+    /* Safety check for coordinates */
     if (x < 0 || x >= width || y < 0 || y >= height)
         return 0;
     
@@ -459,9 +484,16 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     WaveFiltContext *s = ctx->priv;
     AVFilterLink *outlink = ctx->outputs[0];
     AVFrame *out;
-    int plane;
+    int plane, x, y;
+    double dx, dy;
+    int sx, sy;
+    int width, height, linesize, dst_linesize;
+    const uint8_t *src;
+    uint8_t *dst;    double amplitude_scale_x, amplitude_scale_y;
+    float v;
+    int sxi, syi;
     
-    // Safety checks
+    /* Safety checks */
     if (!ctx || !s || !inlink || !outlink || !in) {
         av_log(ctx, AV_LOG_ERROR, "Null pointer in filter_frame\n");
         if (in)
@@ -469,7 +501,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
         return AVERROR(EINVAL);
     }
     
-    // Check dimensions
+    /* Check dimensions */
     if (in->width <= 0 || in->height <= 0) {
         av_log(ctx, AV_LOG_ERROR, "Invalid input dimensions: %dx%d\n", in->width, in->height);
         av_frame_free(&in);
@@ -487,18 +519,13 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     
     // Update time value
     if (s->pts != AV_NOPTS_VALUE && in->pts != AV_NOPTS_VALUE) {
-        s->time += (in->pts - s->pts) * av_q2d(inlink->time_base) / s->time_base;
-    } else if (in->pts != AV_NOPTS_VALUE) {
+        s->time += (in->pts - s->pts) * av_q2d(inlink->time_base) / s->time_base;    } else if (in->pts != AV_NOPTS_VALUE) {
         s->time = in->pts * av_q2d(inlink->time_base) / s->time_base;
     }
     s->pts = in->pts;
-      for (plane = 0; plane < s->nb_planes; plane++) {        int width, height, linesize, dst_linesize; 
-        const uint8_t *src;
-        uint8_t *dst;
-        double amplitude_scale_x, amplitude_scale_y;
-        int x, y;
-        
-        // Skip plane if data is not available
+    
+    for (plane = 0; plane < s->nb_planes; plane++) {
+        /* Skip plane if data is not available */
         if (!in->data[plane] || !out->data[plane]) {
             av_log(ctx, AV_LOG_WARNING, "Skipping plane %d due to NULL data\n", plane);
             continue;
@@ -509,7 +536,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
         linesize = in->linesize[plane];
         dst_linesize = out->linesize[plane];
         
-        // Skip if dimensions or linesize are invalid
+        /* Skip if dimensions or linesize are invalid */
         if (width <= 0 || height <= 0 || linesize <= 0 || dst_linesize <= 0) {
             av_log(ctx, AV_LOG_WARNING, "Skipping plane %d due to invalid dimensions\n", plane);
             continue;
@@ -518,23 +545,23 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
         src = in->data[plane];
         dst = out->data[plane];
         
-        // Scale for subsampled planes
+        /* Scale for subsampled planes */
         amplitude_scale_x = (plane == 1 || plane == 2) ? 0.5 : 1.0;
         amplitude_scale_y = (plane == 1 || plane == 2) ? 0.5 : 1.0;
         
         for (y = 0; y < height; y++) {
-            for (x = 0; x < width; x++) {                double dx, dy;
-                int sx, sy;
-                
+            for (x = 0; x < width; x++) {
                 dx = calculate_x_displacement(s, x, y, plane, width, height, s->time) * amplitude_scale_x;
                 dy = calculate_y_displacement(s, x, y, plane, width, height, s->time) * amplitude_scale_y;
                 
-                // Convert to fixed-point for interpolation
+                /* Convert to fixed-point for interpolation */
                 sx = (int)((x << 16) - (dx * 65536));
-                sy = (int)((y << 16) - (dy * 65536));                  // Handle out of bounds with a simple mirroring implementation
+                sy = (int)((y << 16) - (dy * 65536));
+                
+                /* Handle out of bounds with a simple mirroring implementation */
                 if (s->mirror) {
-                    int sxi = sx >> 16;
-                    int syi = sy >> 16;
+                    sxi = sx >> 16;
+                    syi = sy >> 16;
                     
                     // Simple bounds checking and mirroring
                     if (sxi < 0)
@@ -553,11 +580,12 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
                         sxi = (width * 2 - 1) - sxi;
                     if (syi >= height)
                         syi = (height * 2 - 1) - syi;
-                    
-                    // Put back into fixed-point format
+                      // Put back into fixed-point format
                     sx = sxi << 16 | (sx & 0xFFFF);
                     sy = syi << 16 | (sy & 0xFFFF);
-                }// Interpolate
+                }
+                
+                // Interpolate
                 if ((sx >> 16) < 0 || (sx >> 16) >= width - 1 || (sy >> 16) < 0 || (sy >> 16) >= height - 1) {
                     // Out of bounds, use zero or edge value
                     if (s->mirror) {
@@ -572,10 +600,8 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
                             dst[y * dst_linesize + x] = 0;
                     } else {
                         dst[y * dst_linesize + x] = 0;
-                    }
-                } else {
-                    float v;
-                      switch(s->distort_mode) {
+                    }                } else {
+                    switch(s->distort_mode) {
                         case DISTORT_NEAREST:
                             // Add bounds check for NEAREST mode
                             {
@@ -616,6 +642,24 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     return ff_filter_frame(outlink, out);
 }
 
+#define OFFSET(x) offsetof(WaveFiltContext, x)
+
+static const AVFilterPad wavefilt_inputs[] = {
+    {
+        .name         = "default",
+        .type         = AVMEDIA_TYPE_VIDEO,
+        .filter_frame = filter_frame,
+        .config_props = config_props,
+    },
+};
+
+static const AVFilterPad wavefilt_outputs[] = {
+    {
+        .name         = "default",
+        .type         = AVMEDIA_TYPE_VIDEO,
+    },
+};
+
 const AVFilter ff_vf_wavefilt = {
     .name          = "wavefilt",
     .description   = NULL_IF_CONFIG_SMALL("Apply wave effects with advanced controls."),
@@ -623,22 +667,8 @@ const AVFilter ff_vf_wavefilt = {
     .priv_class    = &wavefilt_class,
     .init          = init,
     .uninit        = uninit,
-    .inputs        = (const AVFilterPad[]) {
-        {
-            .name         = "default",
-            .type         = AVMEDIA_TYPE_VIDEO,
-            .filter_frame = filter_frame,
-            .config_props = config_props,
-        },
-        { NULL }
-    },
-    .outputs       = (const AVFilterPad[]) {
-        {
-            .name = "default",
-            .type = AVMEDIA_TYPE_VIDEO,
-        },
-        { NULL }
-    },
+    FILTER_INPUTS(wavefilt_inputs),
+    FILTER_OUTPUTS(wavefilt_outputs),
+    FILTER_QUERY_FUNC(query_formats),
     .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
-    .process_command = NULL,
 };
